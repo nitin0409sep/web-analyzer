@@ -6,7 +6,8 @@ import { generateDiagnostics } from "@/lib/suggestions";
 export const maxDuration = 180;
 
 const PSI_API = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed";
-const PSI_API_KEY = process.env.GOOGLE_PSI_API_KEY || "";
+let PSI_API_KEY = process.env.GOOGLE_PSI_API_KEY || "";
+let psiKeyValid = !!PSI_API_KEY; // track if key has been verified as working
 const isServerless = !!process.env.VERCEL || !!process.env.AWS_LAMBDA_FUNCTION_NAME || !!process.env.NETLIFY;
 
 // In-memory cache (URL+strategy -> result, 30 min TTL)
@@ -114,9 +115,10 @@ function extractResourceSummary(lighthouseResult: Record<string, unknown>) {
   return { totalSize, totalRequests, breakdown };
 }
 
-async function runWithPSI(targetUrl: string, strategy: string, retries = 2, withKey = true): Promise<Record<string, unknown>> {
+async function runWithPSI(targetUrl: string, strategy: string, retries = 3): Promise<Record<string, unknown>> {
+  const useKey = psiKeyValid && !!PSI_API_KEY;
   let apiUrl = `${PSI_API}?url=${encodeURIComponent(targetUrl)}&strategy=${strategy}&category=performance`;
-  if (withKey && PSI_API_KEY) {
+  if (useKey) {
     apiUrl += `&key=${encodeURIComponent(PSI_API_KEY)}`;
   }
 
@@ -127,19 +129,20 @@ async function runWithPSI(targetUrl: string, strategy: string, retries = 2, with
     const errorObj = (errorData as Record<string, Record<string, unknown>>)?.error;
     const errorMessage = (errorObj?.message as string) || "Failed to analyze URL";
 
-    // If API key is invalid, retry without it
-    if (withKey && PSI_API_KEY && (response.status === 400 || response.status === 403) && errorMessage.toLowerCase().includes("api key")) {
-      console.log("PSI API key invalid, retrying without key");
-      return runWithPSI(targetUrl, strategy, retries, false);
+    // If API key is invalid, permanently disable it and retry without
+    if (useKey && (response.status === 400 || response.status === 403) && errorMessage.toLowerCase().includes("api key")) {
+      console.log("PSI API key invalid, disabling for all future requests");
+      psiKeyValid = false;
+      return runWithPSI(targetUrl, strategy, retries);
     }
 
-    // Retry on rate limit with exponential backoff
+    // Retry on rate limit with longer backoff
     if (response.status === 429 || errorMessage.toLowerCase().includes("quota")) {
       if (retries > 0) {
-        const delay = (3 - retries) * 5000; // 5s, 10s
+        const delay = (4 - retries) * 15000; // 15s, 30s, 45s
         console.log(`Rate limited, retrying in ${delay / 1000}s (${retries} retries left)`);
         await new Promise((r) => setTimeout(r, delay));
-        return runWithPSI(targetUrl, strategy, retries - 1, withKey);
+        return runWithPSI(targetUrl, strategy, retries - 1);
       }
       throw new Error("API quota exceeded. Please try again in a minute.");
     }
