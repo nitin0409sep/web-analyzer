@@ -114,13 +114,9 @@ function extractResourceSummary(lighthouseResult: Record<string, unknown>) {
   return { totalSize, totalRequests, breakdown };
 }
 
-async function runWithPSI(targetUrl: string, strategy: string): Promise<Record<string, unknown>> {
-  if (isServerless && !PSI_API_KEY) {
-    throw new Error("GOOGLE_PSI_API_KEY environment variable is required for serverless deployments. Get one at https://console.cloud.google.com/apis/credentials");
-  }
-
+async function runWithPSI(targetUrl: string, strategy: string, withKey = true): Promise<Record<string, unknown>> {
   let apiUrl = `${PSI_API}?url=${encodeURIComponent(targetUrl)}&strategy=${strategy}&category=performance`;
-  if (PSI_API_KEY) {
+  if (withKey && PSI_API_KEY) {
     apiUrl += `&key=${encodeURIComponent(PSI_API_KEY)}`;
   }
 
@@ -130,6 +126,12 @@ async function runWithPSI(targetUrl: string, strategy: string): Promise<Record<s
     const errorData = await response.json().catch(() => ({}));
     const errorObj = (errorData as Record<string, Record<string, unknown>>)?.error;
     const errorMessage = (errorObj?.message as string) || "Failed to analyze URL";
+
+    // If API key is invalid, retry without it
+    if (withKey && PSI_API_KEY && (response.status === 400 || response.status === 403) && errorMessage.toLowerCase().includes("api key")) {
+      console.log("PSI API key invalid, retrying without key");
+      return runWithPSI(targetUrl, strategy, false);
+    }
 
     if (response.status === 429 || errorMessage.toLowerCase().includes("quota")) {
       throw new Error("API quota exceeded. Please try again later.");
