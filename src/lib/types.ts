@@ -46,3 +46,8 @@ export interface AnalysisResult {
   } | null;
   screenshot: string | null;
 }
+
+export interface DualAnalysisResult {
+  mobile: AnalysisResult;
+  desktop: AnalysisResult;
+}

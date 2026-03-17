@@ -1,6 +1,7 @@
 "use client";
 
 import { PerformanceMetric } from "@/lib/types";
+import { getMetricExplanation } from "@/lib/metric-explanations";
 import { Info } from "lucide-react";
 import { useState } from "react";
 
@@ -10,6 +11,7 @@ interface MetricCardProps {
 
 export default function MetricCard({ metric }: MetricCardProps) {
   const [showInfo, setShowInfo] = useState(false);
+  const explanation = getMetricExplanation(metric.id);
 
   const getScoreColor = (score: number | null) => {
     if (score === null) return "text-zinc-400";
@@ -43,8 +45,29 @@ export default function MetricCard({ metric }: MetricCardProps) {
         </button>
       </div>
       {showInfo && (
-        <div className="mt-3 pt-3 border-t border-white/5">
-          <p className="text-xs text-zinc-400">{metric.description}</p>
+        <div className="mt-3 pt-3 border-t border-white/5 space-y-2">
+          {explanation ? (
+            <>
+              <p className="text-xs text-zinc-300">{explanation.plain}</p>
+              <div className="text-xs space-y-1">
+                <div className="flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-perf-green shrink-0" />
+                  <span className="text-zinc-400">Good: {explanation.good}</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-perf-yellow shrink-0" />
+                  <span className="text-zinc-400">Okay: {explanation.needsWork}</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-perf-red shrink-0" />
+                  <span className="text-zinc-400">Slow: {explanation.poor}</span>
+                </div>
+              </div>
+              <p className="text-xs text-zinc-500 italic">{explanation.tip}</p>
+            </>
+          ) : (
+            <p className="text-xs text-zinc-400">{metric.description}</p>
+          )}
         </div>
       )}
     </div>

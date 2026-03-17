@@ -2,8 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { AnalysisResult, PerformanceMetric, AuditItem } from "@/lib/types";
 import { generateDiagnostics } from "@/lib/suggestions";
 
-// Allow up to 2 minutes for Lighthouse to complete
-export const maxDuration = 120;
+// Allow up to 3 minutes for dual Lighthouse runs
+export const maxDuration = 180;
 
 const PSI_API = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed";
 const PSI_API_KEY = process.env.GOOGLE_PSI_API_KEY || "";
@@ -171,9 +171,50 @@ async function runWithLocalLighthouse(targetUrl: string, strategy: string): Prom
   }
 }
 
+async function getLighthouseResult(targetUrl: string, strategy: string): Promise<Record<string, unknown>> {
+  if (isServerless) {
+    return runWithPSI(targetUrl, strategy);
+  }
+  try {
+    return await runWithLocalLighthouse(targetUrl, strategy);
+  } catch {
+    console.log("Local Lighthouse failed, falling back to PSI API");
+    return runWithPSI(targetUrl, strategy);
+  }
+}
+
+function buildAnalysisResult(targetUrl: string, lighthouseResult: Record<string, unknown>): AnalysisResult {
+  const metrics = extractMetrics(lighthouseResult);
+  const opportunities = extractAudits(lighthouseResult, "opportunities");
+  const passedAudits = extractAudits(lighthouseResult, "passed");
+  const diagnostics = generateDiagnostics(opportunities);
+  const resourceSummary = extractResourceSummary(lighthouseResult);
+
+  const categories = lighthouseResult.categories as Record<string, Record<string, unknown>>;
+  const overallScore = Math.round(((categories.performance.score as number) || 0) * 100);
+
+  const audits = lighthouseResult.audits as Record<string, Record<string, unknown>>;
+  const screenshotAudit = audits["final-screenshot"];
+  const screenshot = screenshotAudit?.details
+    ? ((screenshotAudit.details as Record<string, unknown>).data as string) || null
+    : null;
+
+  return {
+    url: targetUrl,
+    fetchTime: new Date().toISOString(),
+    overallScore,
+    metrics,
+    diagnostics,
+    opportunities,
+    passedAudits,
+    resourceSummary,
+    screenshot,
+  };
+}
+
 export async function POST(request: NextRequest) {
   try {
-    const { url, strategy = "mobile" } = await request.json();
+    const { url, strategy = "both" } = await request.json();
 
     if (!url) {
       return NextResponse.json({ error: "URL is required" }, { status: 400 });
@@ -187,54 +228,67 @@ export async function POST(request: NextRequest) {
     // Validate URL format
     new URL(targetUrl);
 
+    // Dual analysis mode
+    if (strategy === "both") {
+      const mobileCacheKey = `${targetUrl}:mobile`;
+      const desktopCacheKey = `${targetUrl}:desktop`;
+      const cachedMobile = cache.get(mobileCacheKey);
+      const cachedDesktop = cache.get(desktopCacheKey);
+
+      const now = Date.now();
+      const hasCachedMobile = cachedMobile && cachedMobile.expiry > now;
+      const hasCachedDesktop = cachedDesktop && cachedDesktop.expiry > now;
+
+      let mobileResult: AnalysisResult;
+      let desktopResult: AnalysisResult;
+
+      if (hasCachedMobile && hasCachedDesktop) {
+        mobileResult = cachedMobile.data;
+        desktopResult = cachedDesktop.data;
+      } else if (isServerless) {
+        // Run in parallel on serverless (PSI API)
+        const [mobileLH, desktopLH] = await Promise.all([
+          hasCachedMobile ? Promise.resolve(null) : getLighthouseResult(targetUrl, "mobile"),
+          hasCachedDesktop ? Promise.resolve(null) : getLighthouseResult(targetUrl, "desktop"),
+        ]);
+        mobileResult = hasCachedMobile ? cachedMobile.data : buildAnalysisResult(targetUrl, mobileLH!);
+        desktopResult = hasCachedDesktop ? cachedDesktop.data : buildAnalysisResult(targetUrl, desktopLH!);
+      } else {
+        // Run sequentially locally to avoid resource contention
+        if (hasCachedMobile) {
+          mobileResult = cachedMobile.data;
+        } else {
+          const mobileLH = await getLighthouseResult(targetUrl, "mobile");
+          mobileResult = buildAnalysisResult(targetUrl, mobileLH);
+        }
+        if (hasCachedDesktop) {
+          desktopResult = cachedDesktop.data;
+        } else {
+          const desktopLH = await getLighthouseResult(targetUrl, "desktop");
+          desktopResult = buildAnalysisResult(targetUrl, desktopLH);
+        }
+      }
+
+      // Cache individual results
+      if (!hasCachedMobile) {
+        cache.set(mobileCacheKey, { data: mobileResult, expiry: now + CACHE_TTL });
+      }
+      if (!hasCachedDesktop) {
+        cache.set(desktopCacheKey, { data: desktopResult, expiry: now + CACHE_TTL });
+      }
+
+      return NextResponse.json({ mobile: mobileResult, desktop: desktopResult });
+    }
+
+    // Single strategy mode
     const cacheKey = `${targetUrl}:${strategy}`;
     const cached = cache.get(cacheKey);
     if (cached && cached.expiry > Date.now()) {
       return NextResponse.json(cached.data);
     }
 
-    // Use PSI API on serverless platforms, local Lighthouse otherwise
-    let lighthouseResult: Record<string, unknown>;
-
-    if (isServerless) {
-      lighthouseResult = await runWithPSI(targetUrl, strategy);
-    } else {
-      try {
-        lighthouseResult = await runWithLocalLighthouse(targetUrl, strategy);
-      } catch {
-        // Fallback to PSI API if local Chrome isn't available
-        console.log("Local Lighthouse failed, falling back to PSI API");
-        lighthouseResult = await runWithPSI(targetUrl, strategy);
-      }
-    }
-
-    const metrics = extractMetrics(lighthouseResult);
-    const opportunities = extractAudits(lighthouseResult, "opportunities");
-    const passedAudits = extractAudits(lighthouseResult, "passed");
-    const diagnostics = generateDiagnostics(opportunities);
-    const resourceSummary = extractResourceSummary(lighthouseResult);
-
-    const categories = lighthouseResult.categories as Record<string, Record<string, unknown>>;
-    const overallScore = Math.round(((categories.performance.score as number) || 0) * 100);
-
-    const audits = lighthouseResult.audits as Record<string, Record<string, unknown>>;
-    const screenshotAudit = audits["final-screenshot"];
-    const screenshot = screenshotAudit?.details
-      ? ((screenshotAudit.details as Record<string, unknown>).data as string) || null
-      : null;
-
-    const result: AnalysisResult = {
-      url: targetUrl,
-      fetchTime: new Date().toISOString(),
-      overallScore,
-      metrics,
-      diagnostics,
-      opportunities,
-      passedAudits,
-      resourceSummary,
-      screenshot,
-    };
-
+    const lighthouseResult = await getLighthouseResult(targetUrl, strategy);
+    const result = buildAnalysisResult(targetUrl, lighthouseResult);
     cache.set(cacheKey, { data: result, expiry: Date.now() + CACHE_TTL });
 
     return NextResponse.json(result);

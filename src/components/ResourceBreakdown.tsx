@@ -1,19 +1,13 @@
 "use client";
 
+import { formatBytes } from "@/lib/format";
+
 interface ResourceBreakdownProps {
   resourceSummary: {
     totalSize: number;
     totalRequests: number;
     breakdown: Record<string, { size: number; count: number }>;
   };
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B";
-  const k = 1024;
-  const sizes = ["B", "KB", "MB", "GB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
 }
 
 const RESOURCE_LABELS: Record<string, string> = {
@@ -47,7 +41,10 @@ export default function ResourceBreakdown({ resourceSummary }: ResourceBreakdown
 
   return (
     <div className="rounded-xl border border-card-border bg-card p-6">
-      <h3 className="text-lg font-semibold mb-4">Resource Breakdown</h3>
+      <h3 className="text-lg font-semibold mb-1">Resource Breakdown</h3>
+      <p className="text-xs text-zinc-500 mb-4">
+        This shows how much data your page downloads, broken down by type. Smaller pages load faster, especially on mobile networks.
+      </p>
 
       <div className="flex gap-6 mb-6">
         <div>
