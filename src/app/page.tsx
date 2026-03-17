@@ -24,11 +24,17 @@ export default function Home() {
     setResult(null);
 
     try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 120000); // 2 min timeout
+
       const res = await fetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url: url.trim(), strategy }),
+        signal: controller.signal,
       });
+
+      clearTimeout(timeout);
 
       const data = await res.json();
 
@@ -38,8 +44,12 @@ export default function Home() {
       }
 
       setResult(data);
-    } catch {
-      setError("Failed to connect to the analysis service");
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        setError("Analysis timed out. The site may be too slow or unreachable.");
+      } else {
+        setError("Failed to connect to the analysis service. Make sure the dev server is running.");
+      }
     } finally {
       setLoading(false);
     }

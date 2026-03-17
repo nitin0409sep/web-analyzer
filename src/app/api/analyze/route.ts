@@ -1,8 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { AnalysisResult, PerformanceMetric, AuditItem } from "@/lib/types";
 import { generateDiagnostics } from "@/lib/suggestions";
-import lighthouse from "lighthouse";
-import * as chromeLauncher from "chrome-launcher";
+
+// Allow up to 2 minutes for Lighthouse to complete
+export const maxDuration = 120;
+
+const PSI_API = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed";
+const PSI_API_KEY = process.env.GOOGLE_PSI_API_KEY || "";
+const isServerless = !!process.env.VERCEL || !!process.env.AWS_LAMBDA_FUNCTION_NAME || !!process.env.NETLIFY;
 
 // In-memory cache (URL+strategy -> result, 30 min TTL)
 const cache = new Map<string, { data: AnalysisResult; expiry: number }>();
@@ -109,37 +114,41 @@ function extractResourceSummary(lighthouseResult: Record<string, unknown>) {
   return { totalSize, totalRequests, breakdown };
 }
 
-export async function POST(request: NextRequest) {
-  let chrome: chromeLauncher.LaunchedChrome | null = null;
+async function runWithPSI(targetUrl: string, strategy: string): Promise<Record<string, unknown>> {
+  let apiUrl = `${PSI_API}?url=${encodeURIComponent(targetUrl)}&strategy=${strategy}&category=performance`;
+  if (PSI_API_KEY) {
+    apiUrl += `&key=${encodeURIComponent(PSI_API_KEY)}`;
+  }
+
+  const response = await fetch(apiUrl);
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    const errorObj = (errorData as Record<string, Record<string, unknown>>)?.error;
+    const errorMessage = (errorObj?.message as string) || "Failed to analyze URL";
+
+    if (response.status === 429 || errorMessage.toLowerCase().includes("quota")) {
+      throw new Error("API quota exceeded. Please try again later.");
+    }
+    throw new Error(errorMessage);
+  }
+
+  const data = await response.json();
+  if (!data.lighthouseResult) {
+    throw new Error("No Lighthouse data returned");
+  }
+  return data.lighthouseResult as Record<string, unknown>;
+}
+
+async function runWithLocalLighthouse(targetUrl: string, strategy: string): Promise<Record<string, unknown>> {
+  const lighthouse = (await import("lighthouse")).default;
+  const chromeLauncher = await import("chrome-launcher");
+
+  const chrome = await chromeLauncher.launch({
+    chromeFlags: ["--headless", "--no-sandbox", "--disable-gpu"],
+  });
 
   try {
-    const { url, strategy = "mobile" } = await request.json();
-
-    if (!url) {
-      return NextResponse.json({ error: "URL is required" }, { status: 400 });
-    }
-
-    // Validate URL
-    let targetUrl = url;
-    if (!targetUrl.startsWith("http://") && !targetUrl.startsWith("https://")) {
-      targetUrl = "https://" + targetUrl;
-    }
-
-    // Validate URL format
-    new URL(targetUrl);
-
-    const cacheKey = `${targetUrl}:${strategy}`;
-    const cached = cache.get(cacheKey);
-    if (cached && cached.expiry > Date.now()) {
-      return NextResponse.json(cached.data);
-    }
-
-    // Launch headless Chrome
-    chrome = await chromeLauncher.launch({
-      chromeFlags: ["--headless", "--no-sandbox", "--disable-gpu"],
-    });
-
-    // Run Lighthouse locally
     const runnerResult = await lighthouse(targetUrl, {
       port: chrome.port,
       output: "json",
@@ -154,10 +163,50 @@ export async function POST(request: NextRequest) {
     });
 
     if (!runnerResult?.lhr) {
-      return NextResponse.json({ error: "Lighthouse returned no results" }, { status: 500 });
+      throw new Error("Lighthouse returned no results");
+    }
+    return runnerResult.lhr as unknown as Record<string, unknown>;
+  } finally {
+    await chrome.kill();
+  }
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const { url, strategy = "mobile" } = await request.json();
+
+    if (!url) {
+      return NextResponse.json({ error: "URL is required" }, { status: 400 });
     }
 
-    const lighthouseResult = runnerResult.lhr as unknown as Record<string, unknown>;
+    let targetUrl = url;
+    if (!targetUrl.startsWith("http://") && !targetUrl.startsWith("https://")) {
+      targetUrl = "https://" + targetUrl;
+    }
+
+    // Validate URL format
+    new URL(targetUrl);
+
+    const cacheKey = `${targetUrl}:${strategy}`;
+    const cached = cache.get(cacheKey);
+    if (cached && cached.expiry > Date.now()) {
+      return NextResponse.json(cached.data);
+    }
+
+    // Use PSI API on serverless platforms, local Lighthouse otherwise
+    let lighthouseResult: Record<string, unknown>;
+
+    if (isServerless) {
+      lighthouseResult = await runWithPSI(targetUrl, strategy);
+    } else {
+      try {
+        lighthouseResult = await runWithLocalLighthouse(targetUrl, strategy);
+      } catch {
+        // Fallback to PSI API if local Chrome isn't available
+        console.log("Local Lighthouse failed, falling back to PSI API");
+        lighthouseResult = await runWithPSI(targetUrl, strategy);
+      }
+    }
 
     const metrics = extractMetrics(lighthouseResult);
     const opportunities = extractAudits(lighthouseResult, "opportunities");
@@ -168,7 +217,6 @@ export async function POST(request: NextRequest) {
     const categories = lighthouseResult.categories as Record<string, Record<string, unknown>>;
     const overallScore = Math.round(((categories.performance.score as number) || 0) * 100);
 
-    // Extract screenshot
     const audits = lighthouseResult.audits as Record<string, Record<string, unknown>>;
     const screenshotAudit = audits["final-screenshot"];
     const screenshot = screenshotAudit?.details
@@ -196,9 +244,5 @@ export async function POST(request: NextRequest) {
       { error: error instanceof Error ? error.message : "An unexpected error occurred" },
       { status: 500 }
     );
-  } finally {
-    if (chrome) {
-      await chrome.kill();
-    }
   }
 }
