@@ -115,6 +115,10 @@ function extractResourceSummary(lighthouseResult: Record<string, unknown>) {
 }
 
 async function runWithPSI(targetUrl: string, strategy: string): Promise<Record<string, unknown>> {
+  if (isServerless && !PSI_API_KEY) {
+    throw new Error("GOOGLE_PSI_API_KEY environment variable is required for serverless deployments. Get one at https://console.cloud.google.com/apis/credentials");
+  }
+
   let apiUrl = `${PSI_API}?url=${encodeURIComponent(targetUrl)}&strategy=${strategy}&category=performance`;
   if (PSI_API_KEY) {
     apiUrl += `&key=${encodeURIComponent(PSI_API_KEY)}`;
