@@ -114,7 +114,7 @@ function extractResourceSummary(lighthouseResult: Record<string, unknown>) {
   return { totalSize, totalRequests, breakdown };
 }
 
-async function runWithPSI(targetUrl: string, strategy: string, withKey = true): Promise<Record<string, unknown>> {
+async function runWithPSI(targetUrl: string, strategy: string, retries = 2, withKey = true): Promise<Record<string, unknown>> {
   let apiUrl = `${PSI_API}?url=${encodeURIComponent(targetUrl)}&strategy=${strategy}&category=performance`;
   if (withKey && PSI_API_KEY) {
     apiUrl += `&key=${encodeURIComponent(PSI_API_KEY)}`;
@@ -130,11 +130,18 @@ async function runWithPSI(targetUrl: string, strategy: string, withKey = true): 
     // If API key is invalid, retry without it
     if (withKey && PSI_API_KEY && (response.status === 400 || response.status === 403) && errorMessage.toLowerCase().includes("api key")) {
       console.log("PSI API key invalid, retrying without key");
-      return runWithPSI(targetUrl, strategy, false);
+      return runWithPSI(targetUrl, strategy, retries, false);
     }
 
+    // Retry on rate limit with exponential backoff
     if (response.status === 429 || errorMessage.toLowerCase().includes("quota")) {
-      throw new Error("API quota exceeded. Please try again later.");
+      if (retries > 0) {
+        const delay = (3 - retries) * 5000; // 5s, 10s
+        console.log(`Rate limited, retrying in ${delay / 1000}s (${retries} retries left)`);
+        await new Promise((r) => setTimeout(r, delay));
+        return runWithPSI(targetUrl, strategy, retries - 1, withKey);
+      }
+      throw new Error("API quota exceeded. Please try again in a minute.");
     }
     throw new Error(errorMessage);
   }
@@ -251,8 +258,8 @@ export async function POST(request: NextRequest) {
       if (hasCachedMobile && hasCachedDesktop) {
         mobileResult = cachedMobile.data;
         desktopResult = cachedDesktop.data;
-      } else if (isServerless) {
-        // Run in parallel on serverless (PSI API)
+      } else if (isServerless && PSI_API_KEY) {
+        // Run in parallel on serverless only with a valid API key
         const [mobileLH, desktopLH] = await Promise.all([
           hasCachedMobile ? Promise.resolve(null) : getLighthouseResult(targetUrl, "mobile"),
           hasCachedDesktop ? Promise.resolve(null) : getLighthouseResult(targetUrl, "desktop"),
