@@ -119,7 +119,7 @@ export default function Home() {
         {loading && (
           <div className="mt-12 text-center">
             <Loader2 className="animate-spin mx-auto text-accent" size={40} />
-            <p className="text-zinc-400 mt-4">Running Lighthouse analysis via PageSpeed Insights...</p>
+            <p className="text-zinc-400 mt-4">Running Lighthouse analysis locally...</p>
             <p className="text-zinc-600 text-sm mt-1">This usually takes 15-30 seconds</p>
           </div>
         )}
@@ -232,7 +232,7 @@ export default function Home() {
                 </span>
               </div>
               <p className="mt-2">
-                Powered by Google PageSpeed Insights (Lighthouse). Results may vary between runs.
+                Powered by Lighthouse (running locally). Results may vary between runs.
               </p>
             </div>
           </div>

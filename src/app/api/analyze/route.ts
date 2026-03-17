@@ -1,8 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { AnalysisResult, PerformanceMetric, AuditItem } from "@/lib/types";
 import { generateDiagnostics } from "@/lib/suggestions";
+import lighthouse from "lighthouse";
+import * as chromeLauncher from "chrome-launcher";
 
-const PSI_API = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed";
+// In-memory cache (URL+strategy -> result, 30 min TTL)
+const cache = new Map<string, { data: AnalysisResult; expiry: number }>();
+const CACHE_TTL = 30 * 60 * 1000;
 
 function extractMetrics(lighthouseResult: Record<string, unknown>): PerformanceMetric[] {
   const audits = lighthouseResult.audits as Record<string, Record<string, unknown>>;
@@ -106,6 +110,8 @@ function extractResourceSummary(lighthouseResult: Record<string, unknown>) {
 }
 
 export async function POST(request: NextRequest) {
+  let chrome: chromeLauncher.LaunchedChrome | null = null;
+
   try {
     const { url, strategy = "mobile" } = await request.json();
 
@@ -119,31 +125,39 @@ export async function POST(request: NextRequest) {
       targetUrl = "https://" + targetUrl;
     }
 
-    // Check if localhost - PSI can't analyze localhost
-    const urlObj = new URL(targetUrl);
-    if (urlObj.hostname === "localhost" || urlObj.hostname === "127.0.0.1") {
-      return NextResponse.json(
-        { error: "PageSpeed Insights cannot analyze localhost URLs. Deploy your app or use a tunneling service like ngrok to get a public URL." },
-        { status: 400 }
-      );
+    // Validate URL format
+    new URL(targetUrl);
+
+    const cacheKey = `${targetUrl}:${strategy}`;
+    const cached = cache.get(cacheKey);
+    if (cached && cached.expiry > Date.now()) {
+      return NextResponse.json(cached.data);
     }
 
-    const apiUrl = `${PSI_API}?url=${encodeURIComponent(targetUrl)}&strategy=${strategy}&category=performance`;
+    // Launch headless Chrome
+    chrome = await chromeLauncher.launch({
+      chromeFlags: ["--headless", "--no-sandbox", "--disable-gpu"],
+    });
 
-    const response = await fetch(apiUrl);
+    // Run Lighthouse locally
+    const runnerResult = await lighthouse(targetUrl, {
+      port: chrome.port,
+      output: "json",
+      onlyCategories: ["performance"],
+      formFactor: strategy === "desktop" ? "desktop" : "mobile",
+      screenEmulation: strategy === "desktop"
+        ? { mobile: false, width: 1350, height: 940, deviceScaleFactor: 1, disabled: false }
+        : undefined,
+      throttling: strategy === "desktop"
+        ? { cpuSlowdownMultiplier: 1, downloadThroughputKbps: 0, uploadThroughputKbps: 0, requestLatencyMs: 0, rttMs: 40, throughputKbps: 10240 }
+        : undefined,
+    });
 
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      const errorMessage = (errorData as Record<string, Record<string, string>>)?.error?.message || "Failed to analyze URL";
-      return NextResponse.json({ error: errorMessage }, { status: response.status });
+    if (!runnerResult?.lhr) {
+      return NextResponse.json({ error: "Lighthouse returned no results" }, { status: 500 });
     }
 
-    const data = await response.json();
-    const lighthouseResult = data.lighthouseResult;
-
-    if (!lighthouseResult) {
-      return NextResponse.json({ error: "No Lighthouse data returned" }, { status: 500 });
-    }
+    const lighthouseResult = runnerResult.lhr as unknown as Record<string, unknown>;
 
     const metrics = extractMetrics(lighthouseResult);
     const opportunities = extractAudits(lighthouseResult, "opportunities");
@@ -173,6 +187,8 @@ export async function POST(request: NextRequest) {
       screenshot,
     };
 
+    cache.set(cacheKey, { data: result, expiry: Date.now() + CACHE_TTL });
+
     return NextResponse.json(result);
   } catch (error) {
     console.error("Analysis error:", error);
@@ -180,5 +196,9 @@ export async function POST(request: NextRequest) {
       { error: error instanceof Error ? error.message : "An unexpected error occurred" },
       { status: 500 }
     );
+  } finally {
+    if (chrome) {
+      await chrome.kill();
+    }
   }
 }
